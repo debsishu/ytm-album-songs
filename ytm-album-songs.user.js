@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Music - Play albums songs
 // @namespace    ytm-album-songs
-// @version      1.0.0
+// @version      1.0.1
 // @description  Plays the song version of album tracks on YouTube Music instead of their music videos. Unofficial userscript port of a patch of the Morphe project.
 // @author       Debsishu Pal
 // @license      GPL-3.0-only
@@ -195,6 +195,17 @@
         const y = normalizeTitle(b);
         if (!x || !y) return false;
         return x === y || x.startsWith(y) || y.startsWith(x);
+    }
+
+    /**
+     * Whether a queue entry's title is the song's title with what marks it as a video, such as
+     * "Song (Official Video)", "Song (Audio)" or "Artist - Song". The album lookup is in English,
+     * so a title the queue writes differently, such as in another script, is not taken to be it.
+     */
+    function isVideoTitleOf(videoTitle, songTitle) {
+        const video = normalizeTitle(videoTitle);
+        const song = normalizeTitle(songTitle);
+        return !!video && !!song && video.includes(song);
     }
 
     function musicVideoTypeOf(watchEndpoint) {
@@ -450,6 +461,7 @@
             musicVideoType: musicVideoTypeOf(watchEndpoint),
             thumbnails: () => renderer.thumbnail && renderer.thumbnail.thumbnails,
             setLength: (text) => setRunsText(renderer.lengthText, text),
+            setTitle: (text) => setRunsText(renderer.title, text),
         };
     }
 
@@ -535,7 +547,9 @@
 
     function matchSong(songs, item, index, positionTrusted) {
         const atIndex = Number.isInteger(index) && index >= 0 && index < songs.length ? songs[index] : null;
-        if (atIndex && titlesMatch(atIndex.title, item.title)) return atIndex;
+        if (atIndex && (titlesMatch(atIndex.title, item.title) || isVideoTitleOf(item.title, atIndex.title))) {
+            return atIndex;
+        }
         // Unavailable tracks can shift the positions, so the track is looked up by its title.
         const wanted = normalizeTitle(item.title);
         if (wanted) {
@@ -580,6 +594,11 @@
                 cache.recordPair(playlistId, item.videoId, song);
                 replaceVideoId(item.renderer, item.videoId, song.videoId, true, art);
                 if (song.durationSeconds > 0) item.setLength(formatDuration(song.durationSeconds));
+                // The queue can name the track as its video does. The player bar and the media
+                // controls show this title too.
+                if (song.title && song.title !== item.title && isVideoTitleOf(item.title, song.title)) {
+                    item.setTitle(song.title);
+                }
                 log('Queueing song:', song.videoId, 'instead of:', item.videoId, item.title);
                 changed = true;
             });
@@ -1015,6 +1034,7 @@
             formatDuration,
             normalizeTitle,
             titlesMatch,
+            isVideoTitleOf,
             endpointOf,
             buildLookupBody,
             install,
