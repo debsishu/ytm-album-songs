@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Music - Play albums songs
 // @namespace    ytm-album-songs
-// @version      1.0.1
+// @version      1.0.2
 // @description  Plays the song version of album tracks on YouTube Music instead of their music videos. Unofficial userscript port of a patch of the Morphe project.
 // @author       Debsishu Pal
 // @license      GPL-3.0-only
@@ -225,6 +225,35 @@
         return thumbnails.map((t) => Object.assign({}, t));
     }
 
+    const isBylineSeparator = (run) => !!run && typeof run.text === 'string' && run.text.trim() === '•';
+
+    function pageTypeOf(run) {
+        const browse = run && run.navigationEndpoint && run.navigationEndpoint.browseEndpoint;
+        const configs = browse && browse.browseEndpointContextSupportedConfigs;
+        return configs && configs.browseEndpointContextMusicConfig && configs.browseEndpointContextMusicConfig.pageType;
+    }
+
+    /**
+     * @return The part of a song's byline after its artists, " • Album • Year" with the album
+     *         linked, or null if the byline names no album, as the one of a music video
+     *         (" • 1B views • 6.1M likes").
+     */
+    function albumBylineOf(longBylineText) {
+        const runs = longBylineText && Array.isArray(longBylineText.runs) ? longBylineText.runs : null;
+        const start = runs ? runs.findIndex(isBylineSeparator) : -1;
+        if (start < 0) return null;
+        const tail = runs.slice(start);
+        if (!tail.some((run) => pageTypeOf(run) === 'MUSIC_PAGE_TYPE_ALBUM')) return null;
+        return JSON.parse(JSON.stringify(tail));
+    }
+
+    /** @return The runs of a byline that name its artists, before the first separator. */
+    function artistRunsOf(longBylineText) {
+        const runs = longBylineText && Array.isArray(longBylineText.runs) ? longBylineText.runs : [];
+        const end = runs.findIndex(isBylineSeparator);
+        return end < 0 ? runs : runs.slice(0, end);
+    }
+
     /**
      * Replaces a video id everywhere in a renderer, including thumbnail urls and endpoints.
      * @param retype Whether the music video type is also changed to the song type.
@@ -367,8 +396,10 @@
                 promise: null,
                 /** Square album art of the songs, or null if not seen yet. */
                 art: null,
-                /** Fetch of the album art in flight, or null. */
-                artPromise: null,
+                /** " • Album • Year" of the bylines of the songs, or null if not seen yet. */
+                albumByline: null,
+                /** Fetch of the album art and byline in flight, or null. */
+                detailsPromise: null,
             };
             entry.promise = this.fetch(playlistId, videoId).then((songs) => {
                 entry.songs = songs;
@@ -419,6 +450,25 @@
             return entry ? entry.art : null;
         }
 
+        /** Keeps the album part of the first song byline seen for the album. */
+        setAlbumByline(playlistId, longBylineText) {
+            const entry = this.entries.get(playlistId);
+            if (!entry || entry.albumByline) return;
+            entry.albumByline = albumBylineOf(longBylineText);
+        }
+
+        getAlbumByline(playlistId) {
+            const entry = this.entries.get(playlistId);
+            return entry ? entry.albumByline : null;
+        }
+
+        /** @return The name of the album, as its songs name it, or null if not seen yet. */
+        getAlbumName(playlistId) {
+            const byline = this.getAlbumByline(playlistId);
+            const run = byline && byline.find((r) => pageTypeOf(r) === 'MUSIC_PAGE_TYPE_ALBUM');
+            return run ? run.text : null;
+        }
+
         /** @return The music video a song replaced in the album, or undefined. */
         getReversePair(playlistId, songVideoId) {
             const entry = this.entries.get(playlistId);
@@ -462,6 +512,10 @@
             thumbnails: () => renderer.thumbnail && renderer.thumbnail.thumbnails,
             setLength: (text) => setRunsText(renderer.lengthText, text),
             setTitle: (text) => setRunsText(renderer.title, text),
+            byline: () => renderer.longBylineText,
+            setByline: (runs) => {
+                renderer.longBylineText = Object.assign({}, renderer.longBylineText, { runs });
+            },
         };
     }
 
@@ -565,7 +619,7 @@
         const sleep = deps.sleep || defaultSleep;
         const log = deps.log || (() => {});
         const fetchPageQueue = deps.fetchPageQueue || (async () => null);
-        const fetchSongArt = deps.fetchSongArt || (async () => null);
+        const fetchSongDetails = deps.fetchSongDetails || (async () => null);
         const cache = new AlbumCache({ sendLookup: deps.sendLookup, now, sleep, log });
 
         function applyGroup(playlistId, group, songs) {
@@ -577,6 +631,7 @@
             const orderTrusted = group.length === songs.length;
 
             const art = cache.getArt(playlistId);
+            const albumByline = cache.getAlbumByline(playlistId);
             let changed = false;
             group.forEach((item, position) => {
                 const index = indexTrusted ? item.index : position;
@@ -598,6 +653,13 @@
                 // controls show this title too.
                 if (song.title && song.title !== item.title && isVideoTitleOf(item.title, song.title)) {
                     item.setTitle(song.title);
+                }
+                // A music video's byline has its views and likes where a song's has its album and
+                // year. What reads the album from it, such as the player bar and other extensions,
+                // otherwise finds none.
+                const artists = artistRunsOf(item.byline());
+                if (albumByline && artists.length) {
+                    item.setByline(artists.concat(JSON.parse(JSON.stringify(albumByline))));
                 }
                 log('Queueing song:', song.videoId, 'instead of:', item.videoId, item.title);
                 changed = true;
@@ -635,6 +697,7 @@
             const playlistId = primaryEndpoint.playlistId;
             cache.fetchIfNeeded(playlistId, primary.videoId);
             cache.setArt(playlistId, merged.thumbnail && merged.thumbnail.thumbnails);
+            cache.setAlbumByline(playlistId, merged.longBylineText);
             cache.recordPair(playlistId, primary.videoId, {
                 videoId: merged.videoId,
                 title: runsText(merged.title),
@@ -655,32 +718,46 @@
             if (!song) return false;
             // Includes the art of the media session, which the player bar and the system show.
             replaceVideoId(json, endpoint.videoId, song.videoId, false, cache.getArt(endpoint.playlistId));
+
+            // A music video's media session has no album, while a song's names it.
+            const overlay = json.playerOverlays && json.playerOverlays.playerOverlayRenderer;
+            const session = overlay && overlay.browserMediaSession && overlay.browserMediaSession.browserMediaSessionRenderer;
+            const albumName = cache.getAlbumName(endpoint.playlistId);
+            if (session && albumName && !runsText(session.album)) session.album = { runs: [{ text: albumName }] };
             return true;
         }
 
         /**
-         * Song entries show the square art of their album, while music videos show a video frame.
-         * The art is taken from a song of the album the queue already has, or else fetched once.
+         * Song entries show the square art of their album, and name the album in their byline, while
+         * music videos show a video frame and their views. Both are taken from a song of the album
+         * the queue already has, or else fetched once.
          */
-        async function ensureAlbumArt(playlistId, group, songs, timeoutMs) {
+        async function ensureAlbumDetails(playlistId, group, songs, timeoutMs) {
             for (const item of group) {
-                if (item.musicVideoType === MUSIC_VIDEO_TYPE_SONG) cache.setArt(playlistId, item.thumbnails());
+                if (item.musicVideoType !== MUSIC_VIDEO_TYPE_SONG) continue;
+                cache.setArt(playlistId, item.thumbnails());
+                cache.setAlbumByline(playlistId, item.byline());
             }
             const entry = cache.entries.get(playlistId);
-            if (!entry || entry.art || group.every((item) => item.musicVideoType === MUSIC_VIDEO_TYPE_SONG)) return;
-            if (!entry.artPromise) {
+            if (!entry || (entry.art && entry.albumByline)) return;
+            if (group.every((item) => item.musicVideoType === MUSIC_VIDEO_TYPE_SONG)) return;
+            if (!entry.detailsPromise) {
                 const song = songs.find(Boolean);
                 if (!song) return;
-                entry.artPromise = Promise.resolve()
-                    .then(() => fetchSongArt(song.videoId))
+                entry.detailsPromise = Promise.resolve()
+                    .then(() => fetchSongDetails(song.videoId))
                     .catch(() => null)
-                    .then((thumbnails) => {
-                        cache.setArt(playlistId, thumbnails);
+                    .then((details) => {
                         // Retried by the next queue when it failed.
-                        if (!entry.art) entry.artPromise = null;
+                        if (!details) {
+                            entry.detailsPromise = null;
+                            return;
+                        }
+                        cache.setArt(playlistId, details.thumbnails);
+                        cache.setAlbumByline(playlistId, details.longBylineText);
                     });
             }
-            await withTimeout(entry.artPromise, timeoutMs);
+            await withTimeout(entry.detailsPromise, timeoutMs);
         }
 
         /**
@@ -704,7 +781,7 @@
             for (const [playlistId, group] of groups) {
                 const songs = await cache.awaitSongs(playlistId, group[0].videoId, deadline - now());
                 if (!songs) continue;
-                await ensureAlbumArt(playlistId, group, songs, deadline - now());
+                await ensureAlbumDetails(playlistId, group, songs, deadline - now());
                 changed = applyGroup(playlistId, group, songs) || changed;
             }
 
@@ -881,14 +958,14 @@
         // The queue of the album, which lists every track as the server does.
         const fetchPageQueue = (videoId, playlistId, context) => postSignedOut('next', context, { videoId, playlistId });
 
-        // A song queued on its own carries the square art of its album.
-        const fetchSongArt = async (songVideoId) => {
+        // A song queued on its own carries the square art of its album, and its byline names the album.
+        const fetchSongDetails = async (songVideoId) => {
             const json = await postSignedOut('music/get_queue', null, { videoIds: [songVideoId] });
             const item = json && collectQueueItems(json).items.find((i) => i.videoId === songVideoId);
-            return item ? item.thumbnails() : null;
+            return item ? { thumbnails: item.thumbnails(), longBylineText: item.byline() } : null;
         };
 
-        const core = createCore({ sendLookup, fetchPageQueue, fetchSongArt, log });
+        const core = createCore({ sendLookup, fetchPageQueue, fetchSongDetails, log });
 
         const hasInitBody = (init) => !!init && init.body !== undefined && init.body !== null;
         const isRequest = (input) => !!input && typeof input === 'object'
