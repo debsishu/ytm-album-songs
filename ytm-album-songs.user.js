@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube Music - Play albums songs
 // @namespace    ytm-album-songs
-// @version      1.0.2
-// @description  Plays the song version of album tracks on YouTube Music instead of their music videos. Unofficial userscript port of a patch of the Morphe project.
+// @version      1.1.1
+// @description  Plays songs instead of music videos on YouTube Music: album tracks, radios and music videos anywhere. Unofficial userscript port of a patch of the Morphe project.
 // @author       Debsishu Pal
 // @license      GPL-3.0-only
 // @icon         https://music.youtube.com/favicon.ico
@@ -260,32 +260,36 @@
      * @param art Album art that replaces the frames of the music video, if known. Otherwise the
      *            frames are of the song, which is the album art in a 16:9 frame.
      */
-    function replaceVideoId(node, fromId, toId, retype, art) {
+    function replaceVideoId(node, fromId, toId, retype, art, urlsOnly) {
         if (Array.isArray(node)) {
             for (let i = 0; i < node.length; i++) {
                 const v = node[i];
-                if (typeof v === 'string') node[i] = replaceInString(v, fromId, toId, retype);
-                else if (v && typeof v === 'object') replaceVideoId(v, fromId, toId, retype, art);
+                if (typeof v === 'string') node[i] = replaceInString(v, fromId, toId, retype, urlsOnly);
+                else if (v && typeof v === 'object') replaceVideoId(v, fromId, toId, retype, art, urlsOnly);
             }
         } else if (node && typeof node === 'object') {
             for (const key of Object.keys(node)) {
                 const v = node[key];
                 if (typeof v === 'string') {
-                    node[key] = replaceInString(v, fromId, toId, retype);
+                    node[key] = replaceInString(v, fromId, toId, retype, urlsOnly);
                 } else if (key === 'thumbnails' && art && Array.isArray(v)
                     && v.some((t) => t && typeof t.url === 'string' && t.url.includes(fromId))) {
                     node[key] = cloneThumbnails(art);
                 } else if (v && typeof v === 'object') {
-                    replaceVideoId(v, fromId, toId, retype, art);
+                    replaceVideoId(v, fromId, toId, retype, art, urlsOnly);
                 }
             }
         }
     }
 
-    function replaceInString(value, fromId, toId, retype) {
+    function replaceInString(value, fromId, toId, retype, urlsOnly) {
         if (value === fromId) return toId;
         if (retype && MUSIC_VIDEO_TYPES_TO_REPLACE.has(value)) return MUSIC_VIDEO_TYPE_SONG;
-        return value.includes(fromId) ? value.split(fromId).join(toId) : value;
+        if (!value.includes(fromId)) return value;
+        // Ids that contain the video id, such as the radio of the video ("RDAMVM" + id), name
+        // something else than the video, so only urls of the video, as thumbnails, are changed then.
+        if (urlsOnly && !value.startsWith('https://')) return value;
+        return value.split(fromId).join(toId);
     }
 
     // endregion
@@ -620,7 +624,30 @@
         const log = deps.log || (() => {});
         const fetchPageQueue = deps.fetchPageQueue || (async () => null);
         const fetchSongDetails = deps.fetchSongDetails || (async () => null);
+        const searchSongs = deps.searchSongs || (async () => null);
+        const fetchSongEntries = deps.fetchSongEntries || (async () => null);
+        // Whether music videos outside of albums play their song too, found by a search.
+        const everywhere = typeof deps.everywhere === 'function' ? deps.everywhere : () => deps.everywhere !== false;
         const cache = new AlbumCache({ sendLookup: deps.sendLookup, now, sleep, log });
+
+        /** Music videos seen in responses: what finding their song needs. */
+        const videos = new SizeRestrictedMap(NUMBER_OF_VIDEOS_TO_REMEMBER);
+        /** Waiting for the details of a music video, by its id. */
+        const videoWaiters = new Map();
+        /** Music video -> song id, from albums, which is exact. */
+        const exactSongs = new SizeRestrictedMap(NUMBER_OF_VIDEOS_TO_REMEMBER);
+        /** Music video -> lookup of its song: { promise, song } with song null when there is none. */
+        const songLookups = new SizeRestrictedMap(NUMBER_OF_VIDEOS_TO_REMEMBER);
+        /** Song id -> its own queue entry, signed out, which has its title, art, byline and length. */
+        const songEntries = new SizeRestrictedMap(NUMBER_OF_SONG_ENTRIES_TO_REMEMBER);
+        /** Playlist id (not an album) -> { pairs: music video -> song id, reverse: song id -> music video }. */
+        const playlistPairs = new SizeRestrictedMap(NUMBER_OF_PLAYLISTS_TO_REMEMBER);
+        /** "RDAMVM" + music video -> "RDAMVM" + its song: a radio started from the song instead. */
+        const radioFlips = new SizeRestrictedMap(NUMBER_OF_PLAYLISTS_TO_REMEMBER);
+        /** Lookups of what a video is that no response showed yet, by its id. */
+        const videoProbes = new SizeRestrictedMap(NUMBER_OF_PLAYLISTS_TO_REMEMBER);
+        /** Music videos the player was asked for as they are: their queue entry stays the music video. */
+        const playedAsVideo = new SizeRestrictedMap(NUMBER_OF_PLAYLISTS_TO_REMEMBER);
 
         function applyGroup(playlistId, group, songs) {
             const indexes = group.map((item) => item.index).filter(Number.isInteger);
@@ -647,6 +674,7 @@
                 }
 
                 cache.recordPair(playlistId, item.videoId, song);
+                exactSongs.set(item.videoId, song.videoId);
                 replaceVideoId(item.renderer, item.videoId, song.videoId, true, art);
                 if (song.durationSeconds > 0) item.setLength(formatDuration(song.durationSeconds));
                 // The queue can name the track as its video does. The player bar and the media
@@ -711,21 +739,243 @@
         }
 
         /** The video the response is about follows its queue entry. */
-        function applyCurrentVideo(json) {
+        function applyCurrentVideo(json, swapped) {
             const endpoint = json.currentVideoEndpoint && json.currentVideoEndpoint.watchEndpoint;
-            if (!endpoint || !isAlbum(endpoint.playlistId) || typeof endpoint.videoId !== 'string') return false;
+            if (!endpoint || typeof endpoint.videoId !== 'string') return false;
+            const other = swapped && swapped.get(endpoint.videoId);
+            if (other) {
+                replaceVideoId(json, endpoint.videoId, other.videoId, false, other.art, true);
+                setMediaSessionAlbum(json, other.albumName);
+                return true;
+            }
+            if (!isAlbum(endpoint.playlistId)) return false;
             const song = cache.getPair(endpoint.playlistId, endpoint.videoId);
             if (!song) return false;
             // Includes the art of the media session, which the player bar and the system show.
-            replaceVideoId(json, endpoint.videoId, song.videoId, false, cache.getArt(endpoint.playlistId));
+            replaceVideoId(json, endpoint.videoId, song.videoId, false, cache.getArt(endpoint.playlistId), true);
 
-            // A music video's media session has no album, while a song's names it.
-            const overlay = json.playerOverlays && json.playerOverlays.playerOverlayRenderer;
-            const session = overlay && overlay.browserMediaSession && overlay.browserMediaSession.browserMediaSessionRenderer;
-            const albumName = cache.getAlbumName(endpoint.playlistId);
-            if (session && albumName && !runsText(session.album)) session.album = { runs: [{ text: albumName }] };
+            setMediaSessionAlbum(json, cache.getAlbumName(endpoint.playlistId));
             return true;
         }
+
+        /** A music video's media session has no album, while a song's names it. */
+        function setMediaSessionAlbum(json, albumName) {
+            const overlay = json.playerOverlays && json.playerOverlays.playerOverlayRenderer;
+            const session = overlay && overlay.browserMediaSession && overlay.browserMediaSession.browserMediaSessionRenderer;
+            if (session && albumName && !runsText(session.album)) session.album = { runs: [{ text: albumName }] };
+        }
+
+        // region Music videos outside of albums
+
+        /** Remembers the music videos a response shows, and the songs of the ones an album page names. */
+        function learnMusicVideos(json) {
+            for (const video of collectMusicVideos(json)) {
+                const known = videos.get(video.videoId);
+                const merged = {
+                    videoId: video.videoId,
+                    title: video.title || (known && known.title),
+                    artists: video.artists.length ? video.artists : (known ? known.artists : []),
+                    durationSeconds: video.durationSeconds || (known ? known.durationSeconds : 0),
+                };
+                videos.set(video.videoId, merged);
+                const waiters = videoWaiters.get(video.videoId);
+                if (waiters && merged.durationSeconds && merged.artists.length) {
+                    videoWaiters.delete(video.videoId);
+                    waiters.forEach((resolve) => resolve(merged));
+                }
+            }
+            for (const pair of collectAlbumCredits(json)) exactSongs.set(pair.videoId, pair.songVideoId);
+        }
+
+        function isKnownMusicVideo(videoId) {
+            return videos.has(videoId) || exactSongs.has(videoId);
+        }
+
+        /**
+         * Finds out what a video no response showed is, from its own queue entry, signed out.
+         * @return Whether it is a music video.
+         */
+        async function probeVideo(videoId, timeoutMs) {
+            if (isKnownMusicVideo(videoId)) return true;
+            if (!everywhere()) return false;
+            if (!videoProbes.has(videoId)) {
+                videoProbes.set(videoId, Promise.resolve()
+                    .then(() => fetchSongEntries([videoId]))
+                    .catch(() => null)
+                    .then((json) => {
+                        if (json) learnMusicVideos(json);
+                        else videoProbes.delete(videoId);
+                    }));
+            }
+            await withTimeout(videoProbes.get(videoId), timeoutMs);
+            return isKnownMusicVideo(videoId);
+        }
+
+        /** @return The details of a music video complete enough to search its song, waiting for them a while. */
+        function videoDetails(videoId, timeoutMs) {
+            const video = videos.get(videoId);
+            if (video && video.durationSeconds && video.artists.length) return Promise.resolve(video);
+            let resolve;
+            const arrived = new Promise((r) => { resolve = r; });
+            if (!videoWaiters.has(videoId)) videoWaiters.set(videoId, []);
+            videoWaiters.get(videoId).push(resolve);
+            return withTimeout(arrived, timeoutMs);
+        }
+
+        /**
+         * @return The song of a music video, or null when there is none for sure, it is not found
+         *         in time, or music videos outside of albums are left as they are.
+         */
+        async function songOfVideo(videoId, timeoutMs) {
+            if (exactSongs.has(videoId)) return { videoId: exactSongs.get(videoId) };
+            if (!everywhere()) return null;
+            const known = songLookups.get(videoId);
+            if (known && known.song !== undefined) return known.song;
+
+            let lookup = known;
+            if (!lookup) {
+                lookup = { song: undefined, promise: null };
+                const deadline = now() + timeoutMs;
+                lookup.promise = (async () => {
+                    const video = await videoDetails(videoId, Math.max(0, deadline - now()));
+                    if (!video) return undefined; // Not known enough yet: asked again later.
+                    let json = null;
+                    try {
+                        json = await searchSongs(songQueryOf(video));
+                    } catch (e) {
+                        log('Song search failed:', e);
+                    }
+                    if (!json) return undefined; // Failed: the next play searches again.
+                    const hits = parseSongSearch(json).slice(0, NUMBER_OF_SEARCH_HITS_TO_CHECK);
+                    const hit = hits.find((h) => isSongOfVideo(video, h)) || null;
+                    log(hit ? 'Song of music video:' : 'No sure song of music video:', videoId, video.title,
+                        hit ? `-> ${hit.videoId} ${hit.title}` : '');
+                    return hit && { videoId: hit.videoId, title: hit.title, durationSeconds: hit.durationSeconds };
+                })().then((song) => {
+                    if (song === undefined) songLookups.delete(videoId);
+                    else lookup.song = song;
+                    return song;
+                });
+                songLookups.set(videoId, lookup);
+            }
+            const song = await withTimeout(lookup.promise, timeoutMs);
+            return song || null;
+        }
+
+        /** @return The own queue entries of songs, by id, fetching the missing ones in one request. */
+        async function entriesOfSongs(songIds, timeoutMs) {
+            const missing = songIds.filter((id) => !songEntries.has(id));
+            if (missing.length) {
+                const json = await withTimeout(
+                    Promise.resolve().then(() => fetchSongEntries(missing)).catch(() => null), timeoutMs);
+                for (const item of json ? collectQueueItems(json).items : []) {
+                    if (item.musicVideoType === MUSIC_VIDEO_TYPE_SONG) songEntries.set(item.videoId, item.renderer);
+                }
+            }
+            return new Map(songIds.filter((id) => songEntries.has(id)).map((id) => [id, songEntries.get(id)]));
+        }
+
+        function pairsOfPlaylist(playlistId) {
+            const key = playlistId || '';
+            if (!playlistPairs.has(key)) playlistPairs.set(key, { pairs: new Map(), reverse: new Map() });
+            return playlistPairs.get(key);
+        }
+
+        /**
+         * The queue entry of a music video becomes the song's own entry, in the place of the music video:
+         * its position, playlist and selection stay.
+         */
+        function putSongEntry(item, songRenderer) {
+            const merged = JSON.parse(JSON.stringify(songRenderer));
+            const videoEndpoint = (item.renderer.navigationEndpoint && item.renderer.navigationEndpoint.watchEndpoint) || {};
+            merged.navigationEndpoint = merged.navigationEndpoint || {};
+            const endpoint = merged.navigationEndpoint.watchEndpoint = merged.navigationEndpoint.watchEndpoint || {};
+            for (const key of ['playlistId', 'index', 'playlistSetVideoId', 'params']) {
+                if (videoEndpoint[key] !== undefined) endpoint[key] = videoEndpoint[key];
+                else delete endpoint[key];
+            }
+            if (item.renderer.selected !== undefined) merged.selected = item.renderer.selected;
+            for (const key of Object.keys(item.renderer)) delete item.renderer[key];
+            Object.assign(item.renderer, merged);
+        }
+
+        /**
+         * Puts the songs of music videos in a queue that is not an album: the playing one before the
+         * queue is shown, if it is found in time, and any found before. The next few are looked up for
+         * the next track changes, which ask for the queue again.
+         * @return Songs put in place of music videos, by music video id.
+         */
+        async function applyOtherQueues(json, items, deadline) {
+            const swapped = new Map();
+            const current = json.currentVideoEndpoint && json.currentVideoEndpoint.watchEndpoint;
+            const videosInQueue = items.filter((item) => !isAlbum(item.playlistId)
+                && item.musicVideoType === 'MUSIC_VIDEO_TYPE_OMV');
+            if (!videosInQueue.length) return swapped;
+
+            let playingIndex = videosInQueue.findIndex((item) => item.renderer.selected
+                || (current && current.videoId === item.videoId));
+            const playing = playingIndex >= 0 ? videosInQueue[playingIndex] : null;
+            // The player already plays it as the music video, so its entry says so.
+            const keptAsVideo = playing && playedAsVideo.has(playing.videoId) ? playing : null;
+            if (playingIndex < 0) playingIndex = 0;
+            const ahead = videosInQueue.slice(playingIndex, playingIndex + 1 + NUMBER_OF_TRACKS_TO_LOOK_UP_AHEAD);
+            for (const item of ahead) if (item !== playing) void songOfVideo(item.videoId, MAX_WAIT_FOR_ALBUM_MS);
+            if (playing && !keptAsVideo) await songOfVideo(playing.videoId, Math.max(0, deadline - now()));
+
+            const songOf = (item) => {
+                if (exactSongs.has(item.videoId)) return exactSongs.get(item.videoId);
+                const lookup = songLookups.get(item.videoId);
+                return lookup && lookup.song ? lookup.song.videoId : null;
+            };
+            const found = videosInQueue.filter((item) => item !== keptAsVideo && songOf(item));
+            if (!found.length) return swapped;
+            const entries = await entriesOfSongs([...new Set(found.map(songOf))], Math.max(0, deadline - now()));
+
+            for (const item of found) {
+                const songId = songOf(item);
+                const entry = entries.get(songId);
+                if (!entry) continue; // Without the song's entry the music video stays.
+                const videoId = item.videoId;
+                const pairs = pairsOfPlaylist(item.playlistId);
+                pairs.pairs.set(videoId, songId);
+                pairs.reverse.set(songId, videoId);
+                putSongEntry(item, entry);
+                swapped.set(videoId, {
+                    videoId: songId,
+                    art: isAlbumArt(entry.thumbnail && entry.thumbnail.thumbnails) ? entry.thumbnail.thumbnails : null,
+                    albumName: (() => {
+                        const byline = albumBylineOf(entry.longBylineText);
+                        const run = byline && byline.find((r) => pageTypeOf(r) === 'MUSIC_PAGE_TYPE_ALBUM');
+                        return run ? run.text : null;
+                    })(),
+                });
+                log('Queueing song:', songId, 'instead of music video:', videoId, item.title);
+            }
+            return swapped;
+        }
+
+        /**
+         * A radio started from a music video is music videos. Started from its song, it is songs.
+         * Only a radio being started is started from the song: one already playing asked for another
+         * radio would have the server start that one from its first track.
+         * @return The radio to ask for instead, or null.
+         */
+        async function flippedRadio(playlistId, videoId) {
+            if (radioFlips.has(playlistId)) return radioFlips.get(playlistId);
+            const seed = radioSeedOf(playlistId);
+            if (!seed || (videoId !== undefined && videoId !== seed)) return null;
+            // A radio is often started from a video no response showed, as on a page opened directly.
+            const deadline = now() + MAX_WAIT_FOR_ALBUM_MS;
+            if (!(await probeVideo(seed, MAX_WAIT_FOR_ALBUM_MS))) return null;
+            const song = await songOfVideo(seed, Math.max(0, deadline - now()));
+            if (!song) return null;
+            const flipped = RADIO_PREFIX + song.videoId;
+            radioFlips.set(playlistId, flipped);
+            log('Starting the radio of song:', song.videoId, 'instead of music video:', seed);
+            return flipped;
+        }
+
+        // endregion
 
         /**
          * Song entries show the square art of their album, and name the album in their byline, while
@@ -765,6 +1015,7 @@
          * @return Whether the response was changed.
          */
         async function processQueueResponse(json, waitMs = MAX_WAIT_FOR_ALBUM_MS) {
+            learnMusicVideos(json);
             const { items, wrappers } = collectQueueItems(json);
             let changed = false;
             for (const wrapper of wrappers) changed = applyWrapper(wrapper) || changed;
@@ -785,11 +1036,13 @@
                 changed = applyGroup(playlistId, group, songs) || changed;
             }
 
-            return applyCurrentVideo(json) || changed;
+            const swapped = await applyOtherQueues(json, items, deadline);
+            return applyCurrentVideo(json, swapped) || swapped.size > 0 || changed;
         }
 
         /** Gives the album fetch a head start as soon as an album is shown. */
         function prefetchAlbums(json) {
+            learnMusicVideos(json);
             const playlistId = findListedAlbum(json);
             if (!playlistId) return;
             cache.fetchIfNeeded(playlistId, null);
@@ -801,12 +1054,43 @@
          * when it is asked about a song it replaced, so it is asked about the music video instead.
          * @return The request body to send, or null to send it unchanged.
          */
-        function rewriteNextRequest(body) {
-            if (!body || !isAlbum(body.playlistId) || typeof body.videoId !== 'string') return null;
-            const musicVideoId = cache.getReversePair(body.playlistId, body.videoId);
-            if (!musicVideoId) return null;
-            body.videoId = musicVideoId;
-            log('Asking for the queue of:', musicVideoId, 'instead of its song');
+        async function rewriteNextRequest(body) {
+            if (!body || typeof body !== 'object') return null;
+            if (isAlbum(body.playlistId)) {
+                if (typeof body.videoId !== 'string') return null;
+                const musicVideoId = cache.getReversePair(body.playlistId, body.videoId);
+                if (!musicVideoId) return null;
+                body.videoId = musicVideoId;
+                log('Asking for the queue of:', musicVideoId, 'instead of its song');
+                return body;
+            }
+
+            // A radio of a music video, also as it is asked for again on every track change.
+            const radio = body.playlistId ? await flippedRadio(body.playlistId, body.videoId) : null;
+            if (radio) {
+                const seed = radioSeedOf(body.playlistId);
+                body.playlistId = radio;
+                if (body.videoId === seed) body.videoId = radio.slice(RADIO_PREFIX.length);
+                return body;
+            }
+            if (typeof body.videoId !== 'string') return null;
+
+            // A queue the server lists with music videos, where this script put songs.
+            if (body.playlistId) {
+                const musicVideoId = playlistPairs.has(body.playlistId)
+                    && playlistPairs.get(body.playlistId).reverse.get(body.videoId);
+                if (!musicVideoId) return null;
+                body.videoId = musicVideoId;
+                log('Asking for the queue of:', musicVideoId, 'instead of its song');
+                return body;
+            }
+
+            // A music video played on its own, which then goes on with its radio.
+            if (!isKnownMusicVideo(body.videoId)) return null;
+            const song = await songOfVideo(body.videoId, MAX_WAIT_FOR_ALBUM_MS);
+            if (!song) return null;
+            log('Playing song:', song.videoId, 'instead of music video:', body.videoId);
+            body.videoId = song.videoId;
             return body;
         }
 
@@ -815,7 +1099,26 @@
          * @return The request body to send, or null to send it unchanged.
          */
         async function rewritePlayerRequest(body) {
-            if (!body || !isAlbum(body.playlistId) || typeof body.videoId !== 'string') return null;
+            if (!body || typeof body.videoId !== 'string') return null;
+            if (!isAlbum(body.playlistId)) {
+                const videoId = body.videoId;
+                const deadline = now() + MAX_WAIT_FOR_ALBUM_MS;
+                const isRadioStart = radioSeedOf(body.playlistId) === videoId;
+                const isMusicVideo = isRadioStart
+                    ? await probeVideo(videoId, MAX_WAIT_FOR_ALBUM_MS)
+                    : isKnownMusicVideo(videoId);
+                const song = isMusicVideo ? await songOfVideo(videoId, Math.max(0, deadline - now())) : null;
+                if (!song) {
+                    // Plays as the music video: the queue must not show its song in its place.
+                    playedAsVideo.set(videoId, true);
+                    return null;
+                }
+                playedAsVideo.delete(videoId);
+                log('Playing song:', song.videoId, 'instead of music video:', videoId);
+                body.videoId = song.videoId;
+                if (radioFlips.has(body.playlistId)) body.playlistId = radioFlips.get(body.playlistId);
+                return body;
+            }
             const song = await resolveAlbumSong(body.playlistId, body.videoId, body.context);
             if (!song) return null;
             log('Playing song:', song.videoId, 'instead of:', body.videoId);
@@ -850,6 +1153,7 @@
             cache,
             processQueueResponse,
             prefetchAlbums,
+            learnMusicVideos,
             rewriteNextRequest,
             rewritePlayerRequest,
         };
@@ -857,10 +1161,348 @@
 
     // endregion
 
+    // region Music videos outside of albums: finding their song
+
+    // Music videos have no exact link to their song outside of albums, so the song is searched for
+    // and only a sure match is taken. Port of the matching of ytm-rs (src/ytm.rs, same_song).
+
+    const SONG_SEARCH_PARAMS = 'EgWKAQIIAWoQEAMQBBAJEAoQBRAREBAQFQ%3D%3D';
+    const NUMBER_OF_SEARCH_HITS_TO_CHECK = 5;
+    const NUMBER_OF_VIDEOS_TO_REMEMBER = 500;
+    const NUMBER_OF_SONG_ENTRIES_TO_REMEMBER = 200;
+    const NUMBER_OF_PLAYLISTS_TO_REMEMBER = 20;
+    // Tracks after the playing one whose songs are looked up ahead, for the next track changes.
+    const NUMBER_OF_TRACKS_TO_LOOK_UP_AHEAD = 3;
+    const RADIO_PREFIX = 'RDAMVM';
+
+    const VIDEO_WORDS = new Set(('official video music lyric lyrics lyrical audio visualizer visualiser hd 4k hq mv '
+        + 'clip videoclip officiel full song with').split(' '));
+    const VIDEO_TITLE_ENDINGS = ['official music video', 'official lyric video', 'official video', 'official audio',
+        'official visualizer', 'music video', 'lyric video', 'lyrical video', 'video song', 'full video'];
+    const RECORDING_VARIANTS = new Set(('live acoustic remix remixed cover instrumental karaoke sped slowed reverb '
+        + 'nightcore 8d demo unplugged orchestral extended version mashup rehearsal edit mix rework bootleg').split(' '));
+    const ARTIST_SEPARATORS = [' | ', ' & ', ', ', ' x ', ' feat. ', ' ft. ', ' and ', ' with '];
+
+    /** A Map that forgets its oldest entries past a size. */
+    class SizeRestrictedMap extends Map {
+        constructor(maxSize) {
+            super();
+            this.maxSize = maxSize;
+        }
+
+        set(key, value) {
+            if (this.has(key)) this.delete(key);
+            super.set(key, value);
+            while (this.size > this.maxSize) this.delete(this.keys().next().value);
+            return this;
+        }
+    }
+
+    /** Lowercase words, punctuation dropped ("Don't" = "dont"). */
+    function words(text) {
+        return String(text || '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, '').split(/\s+/).filter(Boolean).join(' ');
+    }
+
+    /** A music video's title without what marks it as a video: "(Official Video)", "[4K]", "| Lyric Video". */
+    function songTitleOf(videoTitle) {
+        let rest = String(videoTitle || '').split(' | ')[0];
+        let out = '';
+        for (;;) {
+            const open = rest.search(/[([]/);
+            if (open < 0) break;
+            const close = rest.indexOf(rest[open] === '(' ? ')' : ']', open);
+            if (close < 0) break;
+            out += rest.slice(0, open);
+            // Bracketed parts only about the video go. "(Remix Official Video)" says more and stays.
+            const inner = words(rest.slice(open + 1, close)).split(' ').filter(Boolean);
+            if (!inner.every((w) => VIDEO_WORDS.has(w))) out += rest.slice(open, close + 1);
+            rest = rest.slice(close + 1);
+        }
+        let title = (out + rest).trim();
+        for (;;) {
+            const ending = VIDEO_TITLE_ENDINGS.find((e) => title.toLowerCase().endsWith(e));
+            if (!ending) break;
+            const shorter = title.slice(0, title.length - ending.length).replace(/[\s\-–|:"']+$/u, '');
+            if (!shorter) break;
+            title = shorter;
+        }
+        return title;
+    }
+
+    /** A title without the "Artist - " some music videos lead with. */
+    function withoutArtist(title, artists) {
+        const cut = title.indexOf(' - ');
+        if (cut < 0) return title;
+        const lead = words(title.slice(0, cut));
+        const rest = title.slice(cut + 3).trim();
+        return rest && artists.some((a) => words(a) === lead) ? rest : title;
+    }
+
+    /** The title's words without anything in brackets ("(feat. X)", "(2009 Remaster)"). */
+    function baseTitleOf(title) {
+        let out = '';
+        let depth = 0;
+        for (const c of String(title)) {
+            if (c === '(' || c === '[') depth++;
+            else if (c === ')' || c === ']') depth = Math.max(0, depth - 1);
+            else if (depth === 0) out += c;
+        }
+        return words(out);
+    }
+
+    /** Words that make a recording something other than the song itself. */
+    function variantsOf(title) {
+        return [...new Set(words(title).split(' ').filter((w) => RECORDING_VARIANTS.has(w)))].sort();
+    }
+
+    /** The words of each bracketed part of a title. */
+    function qualifiersOf(title) {
+        const out = [];
+        let depth = 0;
+        let part = '';
+        for (const c of String(title)) {
+            if (c === '(' || c === '[') {
+                if (depth === 0) part = '';
+                depth++;
+            } else if ((c === ')' || c === ']') && depth > 0) {
+                depth--;
+                if (depth === 0) out.push(words(part));
+            } else if (depth > 0) {
+                part += c;
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Bracketed parts on one title only must be ones that do not change the recording: a featured
+     * artist, where it is from, a remaster, a year.
+     */
+    function qualifiersAgree(a, b) {
+        const harmless = (q) => {
+            const w = q.split(' ');
+            return ['feat', 'ft', 'featuring', 'with', 'from'].includes(w[0])
+                || w.some((x) => x.startsWith('remaster'))
+                || w.every((x) => /^\d+$/.test(x));
+        };
+        const qa = qualifiersOf(a);
+        const qb = qualifiersOf(b);
+        return qa.filter((q) => !qb.includes(q)).concat(qb.filter((q) => !qa.includes(q))).every(harmless);
+    }
+
+    /** The same artist: the same name, also as one of the names in a longer credit ("A & B"). */
+    function sameArtist(name, credit) {
+        const wanted = words(name);
+        if (!wanted) return false;
+        let parts = [String(credit).toLowerCase()];
+        for (const separator of ARTIST_SEPARATORS) parts = parts.flatMap((p) => p.split(separator));
+        return parts.some((p) => words(p) === wanted);
+    }
+
+    /**
+     * Whether a song from a search is the song of a music video: the same title once the video's own
+     * markings are off, the same kind of recording, everyone on the video credited on the song, and a
+     * length that fits. A video can run longer (an intro, a skit), and often shorter.
+     */
+    function isSongOfVideo(video, hit) {
+        const title = withoutArtist(songTitleOf(video.title), video.artists);
+        const base = baseTitleOf(title);
+        const v = video.durationSeconds;
+        const s = hit.durationSeconds;
+        const fits = v > 0 && s > 0 && s + Math.max(30, Math.floor(v / 5)) >= v && s <= v * 2;
+        return hit.isSong
+            && !!base && base === baseTitleOf(hit.title)
+            && variantsOf(video.title).join() === variantsOf(hit.title).join()
+            && qualifiersAgree(title, hit.title)
+            && video.artists.length > 0
+            && video.artists.every((a) => hit.artists.some((b) => sameArtist(a, b)))
+            && fits;
+    }
+
+    /** @return The search query that finds the song of a music video. */
+    function songQueryOf(video) {
+        return `${withoutArtist(songTitleOf(video.title), video.artists)} ${video.artists[0] || ''}`.trim();
+    }
+
+    const isDuration = (text) => /^\d+(:\d\d)+$/.test(String(text || '').trim());
+
+    function linkedArtistsOf(runs) {
+        // The artists come before the views, the album or the length, and link to their page.
+        return (runs || [])
+            .filter((r) => {
+                const browse = r && r.navigationEndpoint && r.navigationEndpoint.browseEndpoint;
+                const pageType = pageTypeOf(r);
+                return browse && (pageType === 'MUSIC_PAGE_TYPE_ARTIST' || pageType === 'MUSIC_PAGE_TYPE_USER_CHANNEL'
+                    || String(browse.browseId || '').startsWith('UC'));
+            })
+            .map((r) => r.text);
+    }
+
+    function durationOfRuns(runs) {
+        const run = (runs || []).find((r) => r && isDuration(r.text));
+        return run ? parseDuration(run.text) : 0;
+    }
+
+    /** The songs of a song search, best match first. */
+    function parseSongSearch(json) {
+        const hits = [];
+        (function walk(node) {
+            if (Array.isArray(node)) return node.forEach((v) => v && typeof v === 'object' && walk(v));
+            for (const key of Object.keys(node)) {
+                const v = node[key];
+                if (!v || typeof v !== 'object') continue;
+                if (key === 'musicResponsiveListItemRenderer' && v.playlistItemData && v.playlistItemData.videoId) {
+                    const columns = (v.flexColumns || []).map((c) => c.musicResponsiveListItemFlexColumnRenderer
+                        && c.musicResponsiveListItemFlexColumnRenderer.text);
+                    const details = (columns[1] && columns[1].runs) || [];
+                    hits.push({
+                        videoId: v.playlistItemData.videoId,
+                        title: runsText(columns[0]),
+                        artists: linkedArtistsOf(details),
+                        durationSeconds: durationOfRuns(details),
+                        isSong: JSON.stringify(v).includes(`"${MUSIC_VIDEO_TYPE_SONG}"`),
+                    });
+                } else {
+                    walk(v);
+                }
+            }
+        })(json);
+        return hits;
+    }
+
+    /** The id and type of the first video a renderer plays. */
+    function watchedVideoOf(renderer) {
+        let found = null;
+        (function walk(node) {
+            if (found || !node || typeof node !== 'object') return;
+            if (Array.isArray(node)) return node.forEach(walk);
+            if (node.watchEndpoint && typeof node.watchEndpoint.videoId === 'string') {
+                found = { videoId: node.watchEndpoint.videoId, type: musicVideoTypeOf(node.watchEndpoint) };
+                return;
+            }
+            Object.values(node).forEach(walk);
+        })(renderer);
+        return found;
+    }
+
+    /**
+     * @return The music videos a response shows, with what finding their song needs: title,
+     *         artists and length (missing in some cards).
+     */
+    function collectMusicVideos(json) {
+        const videos = [];
+        const add = (videoId, title, artists, durationSeconds) => {
+            if (videoId && title) videos.push({ videoId, title, artists, durationSeconds });
+        };
+        (function walk(node) {
+            if (Array.isArray(node)) return node.forEach((v) => v && typeof v === 'object' && walk(v));
+            for (const key of Object.keys(node)) {
+                const v = node[key];
+                if (!v || typeof v !== 'object') continue;
+                if (key === 'playlistPanelVideoRenderer' && typeof v.videoId === 'string') {
+                    const endpoint = v.navigationEndpoint && v.navigationEndpoint.watchEndpoint;
+                    if (musicVideoTypeOf(endpoint) === 'MUSIC_VIDEO_TYPE_OMV') {
+                        const artistRuns = artistRunsOf(v.longBylineText);
+                        const linked = linkedArtistsOf(artistRuns);
+                        const named = artistRuns.map((r) => String(r.text || '').trim())
+                            .filter((t) => t && t !== '&' && t !== ',');
+                        add(v.videoId, runsText(v.title), linked.length ? linked : named,
+                            parseDuration(runsText(v.lengthText)));
+                    }
+                    continue;
+                }
+                if (key === 'musicResponsiveListItemRenderer') {
+                    const watched = watchedVideoOf(v);
+                    const videoId = (v.playlistItemData && v.playlistItemData.videoId) || (watched && watched.videoId);
+                    if (watched && watched.videoId === videoId && watched.type === 'MUSIC_VIDEO_TYPE_OMV') {
+                        const columns = (v.flexColumns || []).map((c) => c.musicResponsiveListItemFlexColumnRenderer
+                            && c.musicResponsiveListItemFlexColumnRenderer.text);
+                        const details = (columns[1] && columns[1].runs) || [];
+                        const fixed = v.fixedColumns && v.fixedColumns[0]
+                            && v.fixedColumns[0].musicResponsiveListItemFixedColumnRenderer;
+                        add(videoId, runsText(columns[0]), linkedArtistsOf(details),
+                            durationOfRuns(details) || parseDuration(runsText(fixed && fixed.text)));
+                    }
+                    continue;
+                }
+                if (key === 'musicCardShelfRenderer' || key === 'musicTwoRowItemRenderer') {
+                    const watched = watchedVideoOf(v.title || v.navigationEndpoint || v);
+                    if (watched && watched.type === 'MUSIC_VIDEO_TYPE_OMV') {
+                        const runs = (v.subtitle && v.subtitle.runs) || [];
+                        add(watched.videoId, runsText(v.title), linkedArtistsOf(runs), durationOfRuns(runs));
+                    }
+                }
+                walk(v);
+            }
+        })(json);
+        return videos;
+    }
+
+    /**
+     * @return The music video rows of an album page with the song their credits name
+     *         ("View song credits" opens MPTC + the song id), which is exact.
+     */
+    function collectAlbumCredits(json) {
+        const pairs = [];
+        (function walk(node) {
+            if (Array.isArray(node)) return node.forEach((v) => v && typeof v === 'object' && walk(v));
+            for (const key of Object.keys(node)) {
+                const v = node[key];
+                if (!v || typeof v !== 'object') continue;
+                if (key === 'musicResponsiveListItemRenderer' && v.playlistItemData && v.playlistItemData.videoId) {
+                    const watched = watchedVideoOf(v);
+                    if (!watched || watched.type !== 'MUSIC_VIDEO_TYPE_OMV') continue;
+                    const credits = JSON.stringify(v).match(/"browseId":"MPTC([\w-]{11})"/);
+                    if (credits && credits[1] !== v.playlistItemData.videoId) {
+                        pairs.push({ videoId: v.playlistItemData.videoId, songVideoId: credits[1] });
+                    }
+                    continue;
+                }
+                walk(v);
+            }
+        })(json);
+        return pairs;
+    }
+
+    const JS_ESCAPES = { n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', v: '\v', 0: '\0' };
+
+    /** The value of a single-quoted JavaScript string literal, as the page writes its data. */
+    function decodeJsString(text) {
+        return text.replace(/\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|[\s\S])/g, (match, escape) => {
+            if (escape[0] === 'x' || escape[0] === 'u') return String.fromCharCode(parseInt(escape.slice(1), 16));
+            return JS_ESCAPES[escape] !== undefined ? JS_ESCAPES[escape] : escape;
+        });
+    }
+
+    /**
+     * @return The responses a page opened directly embeds in its HTML instead of fetching them,
+     *         from the text of its inline scripts ("initialData.push({path: ..., data: '...'})").
+     */
+    function parseInitialData(scriptText) {
+        const responses = [];
+        if (!scriptText || !scriptText.includes('initialData.push')) return responses;
+        const pattern = /data:\s*'((?:[^'\\]|\\[\s\S])*)'/g;
+        let match;
+        while ((match = pattern.exec(scriptText)) !== null) {
+            try {
+                responses.push(JSON.parse(decodeJsString(match[1])));
+            } catch (e) { /* not a response */ }
+        }
+        return responses;
+    }
+
+    /** @return The video a radio is started from ("RDAMVM" + its id), or null. */
+    function radioSeedOf(playlistId) {
+        const match = /^RDAMVM([\w-]{11})$/.exec(String(playlistId || ''));
+        return match ? match[1] : null;
+    }
+
+    // endregion
+
     // region Browser glue
 
     function endpointOf(url) {
-        const match = /\/youtubei\/v1\/(next|player|browse|music\/get_queue)(?:\?|$)/.exec(url);
+        const match = /\/youtubei\/v1\/(next|player|browse|search|music\/get_queue)(?:\?|$)/.exec(url);
         return match ? match[1] : null;
     }
 
@@ -868,6 +1510,7 @@
         const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
         const settings = {
             enabled: GM_getValue('enabled', true),
+            everywhere: GM_getValue('everywhere', true),
             debug: GM_getValue('debug', false),
         };
         const log = (...args) => {
@@ -877,6 +1520,10 @@
 
         GM_registerMenuCommand(`Play album songs: ${settings.enabled ? 'ON' : 'OFF'} (click to toggle)`, () => {
             GM_setValue('enabled', !settings.enabled);
+            win.location.reload();
+        });
+        GM_registerMenuCommand(`Outside albums too: ${settings.everywhere ? 'ON' : 'OFF'} (click to toggle)`, () => {
+            GM_setValue('everywhere', !settings.everywhere);
             win.location.reload();
         });
         GM_registerMenuCommand(`Debug logging: ${settings.debug ? 'ON' : 'OFF'} (click to toggle)`, () => {
@@ -965,7 +1612,16 @@
             return item ? { thumbnails: item.thumbnails(), longBylineText: item.byline() } : null;
         };
 
-        const core = createCore({ sendLookup, fetchPageQueue, fetchSongDetails, log });
+        // Signed out, so the searches stay out of the account's search history.
+        const searchSongs = (query) => postSignedOut('search', null, { query, params: SONG_SEARCH_PARAMS });
+
+        // Songs queued on their own, in one request: their entries as the queue shows songs.
+        const fetchSongEntries = (songVideoIds) => postSignedOut('music/get_queue', null, { videoIds: songVideoIds });
+
+        const core = createCore({
+            sendLookup, fetchPageQueue, fetchSongDetails, searchSongs, fetchSongEntries,
+            everywhere: settings.everywhere, log,
+        });
 
         const hasInitBody = (init) => !!init && init.body !== undefined && init.body !== null;
         const isRequest = (input) => !!input && typeof input === 'object'
@@ -1023,7 +1679,7 @@
             if (body && body.context && body.context.client) pageClient = body.context.client;
             const rewritten = endpoint === 'player'
                 ? await core.rewritePlayerRequest(body)
-                : core.rewriteNextRequest(body);
+                : await core.rewriteNextRequest(body);
             if (!rewritten) return null;
 
             const newBody = JSON.stringify(rewritten);
@@ -1042,6 +1698,10 @@
             const json = await response.clone().json();
             if (endpoint === 'browse') {
                 core.prefetchAlbums(json);
+                return response;
+            }
+            if (endpoint === 'search') {
+                core.learnMusicVideos(json);
                 return response;
             }
             if (!(await core.processQueueResponse(json))) return response;
@@ -1087,6 +1747,22 @@
             }
         };
 
+        // A page opened directly embeds its first responses in its HTML instead of fetching them.
+        const readInitialData = () => {
+            try {
+                for (const script of win.document.querySelectorAll('script:not([src])')) {
+                    for (const json of parseInitialData(script.textContent)) core.prefetchAlbums(json);
+                }
+            } catch (e) {
+                warn('initial data read failure', e);
+            }
+        };
+        if (win.document.readyState === 'loading') {
+            win.document.addEventListener('DOMContentLoaded', readInitialData, { once: true });
+        } else {
+            readInitialData();
+        }
+
         // Only fetch is handled. Report XMLHttpRequest use so it is noticed if the app switches to it.
         const originalOpen = win.XMLHttpRequest.prototype.open;
         win.XMLHttpRequest.prototype.open = function (method, url) {
@@ -1112,6 +1788,15 @@
             normalizeTitle,
             titlesMatch,
             isVideoTitleOf,
+            isSongOfVideo,
+            songTitleOf,
+            songQueryOf,
+            parseSongSearch,
+            collectMusicVideos,
+            collectAlbumCredits,
+            radioSeedOf,
+            parseInitialData,
+            decodeJsString,
             endpointOf,
             buildLookupBody,
             install,
